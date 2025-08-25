@@ -1,0 +1,15 @@
+# Python bytecode files
+__pycache__/
+*.py[cod]
+
+# Virtual environment folder
+venv/
+
+# Environment variables file
+.env
+
+# Other common files to ignore
+*.pyo
+*.pyd
+*.log
+*.sqlite3
