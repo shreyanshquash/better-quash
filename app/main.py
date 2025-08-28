@@ -1,48 +1,104 @@
 import os
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import tempfile
-
-from app.parser import parse_pdf_with_images
-from app.generator import generate_testcases, generate_testcases_multimodal
+import json
+import asyncio
+from app.parser import parse_pdf_with_images, parse_pdf_with_images_async
+from app.generator import generate_testcases, generate_testcases_multimodal, generate_testcases_with_rag
+from llama_index.llms.gemini import Gemini
 
 
 load_dotenv() #loads the environment variables from the .env file
 
 app = FastAPI() #instantiates the FastAPI app
 
-@app.post("/generate-testcases") #generate-testcases is the endpoint name
-async def upload_and_generate(file: UploadFile = File(...)):   #takes the mandatory file from the user
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp: #creates a temporary file
-        contents = await file.read() #reads the file from the user
-        tmp.write(contents) #writes the file to the temporary file
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        tmp_path = tmp.name #gets the path of the temporary file
 
+@app.post("/generate-testcases")
+async def upload_and_generate(file: UploadFile = File(...)):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+        
         try:
-            # Parse PDF with images
-            parsed_content = parse_pdf_with_images(tmp_path)
+            # Use async version for better performance
+            parsed_content = await parse_pdf_with_images_async(tmp_path)
             
-            # Generate test cases with multimodal support
-            testcases = generate_testcases_multimodal(parsed_content)
+            # Generate test cases using RAG
+            testcases = generate_testcases_with_rag(parsed_content)
             
-            return JSONResponse(content={
-                "testcases": testcases,
-                "content_analysis": {
-                    "text_extracted": len(parsed_content["text_content"]) > 0,
-                    "images_found": parsed_content["total_images"],
-                    "ocr_successful": len(parsed_content["image_content"]) > 0
-                }
-            })
-            # # Parse and generate testcases
-            # text = parse_pdf(tmp_path) #parses the pdf file from parser.py
-            # testcases = generate_testcases(text) #generates the testcases from generator.py
-
-            # return JSONResponse(content={"testcases": testcases}) #returns the testcases
+            return JSONResponse(content={"testcases": testcases})
+            
         finally:
-            # Clean up the temporary file
             os.remove(tmp_path)
+
+@app.get("/test-rag")
+async def test_rag():
+    """Test endpoint to debug RAG system."""
+    try:
+        from app.rag_setup import get_qa_index
+        qa_index = get_qa_index()
+        llm = Gemini(model_name="gemini-1.5-flash")
+        query_engine = qa_index.as_query_engine(
+            llm=llm,
+            response_mode="compact",
+            streaming=False
+        )
+        
+        # Test query
+        test_query = "What are the key testing patterns for API testing?"
+        response = query_engine.query(test_query)
+        
+        # Extract source nodes for debugging
+        source_nodes = []
+        if response.source_nodes:
+            for node in response.source_nodes:
+                source_nodes.append({
+                    "text": node.get_content(),
+                    "score": node.get_score(),
+                    "node_id": node.node_id
+                })
+        
+        return JSONResponse(content={
+            "rag_working": True,
+            "test_query": test_query,
+            "response": str(response),
+            "retrieved_nodes": source_nodes
+        })
+    except Exception as e:
+        return JSONResponse(content={
+            "rag_working": False,
+            "error": str(e),
+            "error_type": str(type(e))
+        }, status_code=500)
+
+@app.post("/reset-rag")
+async def reset_rag():
+    """Reset RAG system to use new API key."""
+    try:
+        from app.rag_setup import reset_qa_index
+        reset_qa_index()
+        return JSONResponse(content={
+            "message": "RAG cache cleared successfully. New requests will use current API key.",
+            "status": "success"
+        })
+    except Exception as e:
+        return JSONResponse(content={
+            "message": f"Failed to reset RAG: {str(e)}",
+            "status": "error"
+        }, status_code=500)
 
 
 

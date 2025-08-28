@@ -3,6 +3,8 @@ import os
 import re
 import json
 from dotenv import load_dotenv
+from app.rag_setup import get_qa_index
+from llama_index.llms.gemini import Gemini
 
 load_dotenv()  # loads the environment variables from the .env file
 
@@ -46,6 +48,123 @@ def clean_response(text: str):
     except json.JSONDecodeError:
         # fallback: wrap in dict if not valid JSON
         return {"raw_output": cleaned}
+
+
+
+def generate_testcases_with_rag(context: dict) -> dict:
+    """Generate test cases using RAG-enhanced context."""
+    
+    try:
+        # Get RAG knowledge (cached after first call)
+        qa_index = get_qa_index()
+        llm = Gemini(model_name="gemini-2.5-pro")
+        query_engine = qa_index.as_query_engine(
+            llm=llm,
+            response_mode="compact",  # Faster responses
+            streaming=False  # Disable streaming for speed
+        )
+        
+        # Extract content and entities from the context
+        text_content = context.get("text_content", "")
+        extracted_entities = context.get("extracted_entities")
+
+        if not text_content or text_content.strip() == "":
+            print("Warning: No text content found, falling back to standard generation")
+            return generate_testcases_multimodal(context)
+
+        # Build a hyper-specific RAG query if we have extracted entities
+        if extracted_entities:
+            features = ", ".join(extracted_entities.get("main_features", []))
+            requirements = ", ".join(extracted_entities.get("key_requirements", []))
+            roles = ", ".join(extracted_entities.get("user_roles", []))
+            rag_query = (
+                f"Provide expert testing strategies, potential pitfalls, and security considerations for an application with these features: [{features}]. "
+                f"It must meet these requirements: [{requirements}]. "
+                f"Consider the following user roles: [{roles}]."
+            )
+            # Also, add the structured data to the final prompt for the generator LLM
+            structured_data_for_prompt = json.dumps(extracted_entities, indent=2)
+        else:
+            # Fallback to the old, generic query if LangExtract failed or was skipped
+            print("No extracted entities found. Using generic RAG query.")
+            rag_query = f"""Based on this PRD content, provide specific testing patterns, test case examples, and quality standards for:
+1. Functional testing approaches
+2. Security testing considerations  
+3. Performance testing scenarios
+4. User interface testing patterns
+5. Integration testing strategies
+
+PRD Content: {text_content[:500]}..."""
+            structured_data_for_prompt = "(Not available)"
+
+        print(f"Executing RAG query: {rag_query[:150]}...")
+        
+        # Quick RAG query
+        qa_knowledge = query_engine.query(rag_query)
+        print(f"RAG response received: {str(qa_knowledge)[:200]}...")
+        
+        # Build full context for the final generator full_context = text_content
+        
+        # Enhanced prompt with RAG context using your better structure
+        enhanced_prompt = f"""You are a world-class QA automation engineer. Your task is to generate a comprehensive suite of 10 test cases based on the provided Product Requirements Document (PRD). You are meticulous, creative, and an expert at finding critical bugs.
+
+**INSTRUCTIONS:**
+1.  **Analyze the PRD:** Carefully read the PRD content and the structured summary provided below.
+2.  **Consult QA Knowledge:** Review the retrieved QA knowledge. This is expert guidance to inspire your test cases. **Do not copy it literally.** Adapt these patterns to the specific features in the PRD.
+3.  **Generate 10 Test Cases:** Create exactly 10 test cases that are specific, actionable, and independently executable.
+4.  **Prioritize High-Impact Scenarios:** Focus on real user workflows, security vulnerabilities, performance bottlenecks, and data integrity. At least 3 of your test cases must specifically target edge cases, boundary conditions, or potential failure modes.
+5.  **Adhere to JSON Schema:** The output must be a single, valid JSON object that strictly follows the provided test case structure. Do not include any extra text or explanations outside of the JSON.
+
+**PRD STRUCTURED SUMMARY (from LangExtract):**
+{structured_data_for_prompt}
+
+**FULL PRD CONTENT:**
+{full_context[:4000]}
+
+**RETRIEVED QA KNOWLEDGE (for inspiration):**
+{qa_knowledge}
+
+**TEST CASE JSON STRUCTURE:**
+{{
+  "testcases": [
+    {{
+      "id": "TC001",
+      "title": "A clear, specific title describing the test scenario and its objective.",
+      "preconditions": "The essential state the system must be in before the test begins. Be concise.",
+      "steps": ["Step 1: A clear, actionable step.", "Step 2: Another clear, actionable step."],
+      "expected_result": "A specific, measurable, and unambiguous outcome."
+    }}
+  ]
+}}
+
+Begin generating the test cases now."""
+        
+        print("Generating test cases with enhanced prompt...")
+        
+        # Generate with enhanced prompt
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=enhanced_prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": SCHEMA,
+                "temperature": 0.1,  # Lower temperature for more consistent output
+            },
+        )
+        
+        result = json.loads(response.text)
+        print(f"Successfully generated {len(result.get('testcases', []))} test cases")
+        return result
+        
+    except Exception as e:
+        print(f"RAG generation failed with error: {e}")
+        print("Falling back to standard generation...")
+        # Fallback to standard generation if RAG fails
+        return generate_testcases_multimodal(context)
+
+
+
 
 def generate_testcases(context: str):
     """Send parsed PRD to Gemini and get structured test cases."""
